@@ -179,7 +179,11 @@ export type LeadProjectHost = {
     ctx: ExtensionContext,
   ): Promise<ProjectAssignment | undefined>;
   writeProjectAssignment: typeof import("../supervision.ts").writeProjectAssignment;
-  liveLead(ctx: ExtensionContext, sessionId: string): Promise<HerdrRecord[]>;
+  liveLead(
+    ctx: ExtensionContext,
+    sessionId: string,
+    sessionPath?: string,
+  ): Promise<HerdrRecord[]>;
   liveAgent(
     ctx: ExtensionContext,
     sessionId: string,
@@ -1883,6 +1887,8 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
     lead: HerdrRecord,
     signal?: AbortSignal,
   ): Promise<ProjectAssignment> => {
+    // Pi writes a new session identity into a headerless file when it opens it.
+    if (herdrSessionId(lead) !== assignment.id) return assignment;
     const piSessionFile = supervisedSessionFile(lead, assignment.id);
     return piSessionFile
       ? persistLeadSessionFile(assignment, piSessionFile, signal)
@@ -3438,9 +3444,8 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
         text: "Project assignment ready.",
         createdAt: Date.now(),
       });
-      let rediscovered: any;
-      while (Date.now() < deadline) {
-        const exact = (await liveLead(ctx, assignment.id)).filter(
+      const exactLiveLead = async (sessionPath?: string) => {
+        const exact = (await liveLead(ctx, assignment.id, sessionPath)).filter(
           (candidate: any) =>
             candidate.workspace_id === workspaceId &&
             candidate.pane_id === paneId &&
@@ -3450,15 +3455,23 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
           throw new Error(
             "Lead identity became ambiguous during project activation",
           );
-        if (exact.length === 1) {
-          rediscovered = exact[0];
-          break;
-        }
+        return exact[0];
+      };
+      let rediscovered: any;
+      while (Date.now() < deadline) {
+        rediscovered = await exactLiveLead();
+        if (rediscovered) break;
         await delay(100, undefined, { signal });
       }
-      if (!rediscovered) {
+      const observed = sessionIdentity(lead.agent_session);
+      // Pi writes its session file only after its first prompt. Until then, the
+      // verified Lead's advertised path stays authoritative.
+      const pristine =
+        !rediscovered && observed?.kind === "path"
+          ? await exactLiveLead(observed.value)
+          : undefined;
+      if (!rediscovered && !pristine) {
         await assertManagerCurrent();
-        const observed = sessionIdentity(lead.agent_session);
         const resolvedSessionId = herdrSessionId(lead);
         if (
           startedLead &&
@@ -3484,11 +3497,13 @@ export function createLeadProjectRuntime(host: LeadProjectHost) {
           }
         }
         throw new Error(
-          "Lead started but its exact Pi session identity did not materialize; assignment preserved",
+          observed?.kind === "path" && !resolvedSessionId
+            ? "Lead started but its advertised Pi session file has no readable header, and the Lead could not be re-verified in its exact pane; assignment preserved"
+            : "Lead started but its exact Pi session identity did not materialize; assignment preserved",
         );
       }
       await assertManagerCurrent();
-      await bindLeadSessionFile(assignment, rediscovered, signal);
+      await bindLeadSessionFile(assignment, rediscovered ?? pristine, signal);
       return {
         content: [
           {

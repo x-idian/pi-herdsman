@@ -96,6 +96,7 @@ import support, {
   writeResult,
   writeAgentState,
   testTmpRoot,
+  isPreservePaneStop,
 } from "./support.ts";
 const { readUnacknowledgedRequest } = await import("./mailbox.ts");
 const { visibleAgentCapabilities } = await import("./agent-controller.ts");
@@ -3726,8 +3727,9 @@ async function runManagerStartupScenario(
     | "unmaterialized-path"
     | "identity-manager-lost-timeout"
     | "identity-manager-lost-success"
-    | "identity-timeout"
-    | "identity-zero-byte-timeout"
+    | "pristine-timeout"
+    | "pristine-zero-byte-timeout"
+    | "pristine-zero-byte-at-start"
     | "identity-unproven"
     | "identity-mismatch"
     | "identity-cleanup-mismatch"
@@ -3798,7 +3800,9 @@ async function runManagerStartupScenario(
   if (limits?.mailboxPayloadLimitBytes !== undefined)
     updateConfig("mailboxPayloadLimitBytes", limits.mailboxPayloadLimitBytes);
   const prospective =
-    mode === "unmaterialized-path" || mode.startsWith("identity-");
+    mode === "unmaterialized-path" ||
+    mode.startsWith("identity-") ||
+    mode.startsWith("pristine-");
   process.env.HERDR_PANE_ID = "root-pane";
   process.env.HERDR_TAB_ID = "root-tab";
   process.env.HERDR_SOCKET_PATH = join(
@@ -4417,6 +4421,10 @@ async function runManagerStartupScenario(
         assert.match(starting.text, /\nTask:\ndeliver the fresh assignment/);
       }
       childSession = starting.id;
+      if (mode === "pristine-zero-byte-at-start") {
+        realFs.writeFileSync(childSessionPath, "");
+        emptySessionStat = realFs.statSync(childSessionPath);
+      }
       if (mode === "success") {
         writeFileSync(
           childSessionPath,
@@ -4614,7 +4622,7 @@ async function runManagerStartupScenario(
         if (mode === "unmaterialized-path" && identityObservations === 2)
           identityPolled();
         if (
-          mode === "identity-zero-byte-timeout" &&
+          mode === "pristine-zero-byte-timeout" &&
           identityObservations === 1
         ) {
           assert.equal(realFs.existsSync(childSessionPath), false);
@@ -4623,8 +4631,9 @@ async function runManagerStartupScenario(
         }
         if (
           [
-            "identity-timeout",
-            "identity-zero-byte-timeout",
+            "pristine-timeout",
+            "pristine-zero-byte-timeout",
+            "pristine-zero-byte-at-start",
             "identity-unproven",
             "identity-mismatch",
             "identity-cleanup-mismatch",
@@ -4692,7 +4701,12 @@ async function runManagerStartupScenario(
           mode === "active-live-wrong-worktree" ||
           mode === "active-live-verification-failure" ||
           mode === "active-live-mismatch" ||
-          (started && startupObservations >= 3) ||
+          (started &&
+            startupObservations >= 3 &&
+            !(
+              delivered &&
+              ["identity-unproven", "identity-cleanup-mismatch"].includes(mode)
+            )) ||
           ([
             "close-resume",
             "close-failure",
@@ -6604,7 +6618,9 @@ async function runManagerStartupScenario(
           ? /Manager changed during project activation/
           : mode === "identity-ambiguity"
             ? /identity became ambiguous/
-            : /identity did not materialize; assignment preserved/,
+            : mode === "identity-mismatch"
+              ? /identity did not materialize; assignment preserved/
+              : /advertised Pi session file has no readable header, and the Lead could not be re-verified in its exact pane; assignment preserved/,
       );
       const assignment = listProjectAssignments(
         supervisionRuntime(),
@@ -6643,20 +6659,7 @@ async function runManagerStartupScenario(
         assert.equal(createCalls, 1);
         assert.equal(startCalls, 1);
       }
-      if (mode === "identity-zero-byte-timeout") {
-        assert.deepEqual(
-          realFs.readFileSync(childSessionPath),
-          Buffer.alloc(0),
-        );
-        const stat = realFs.statSync(childSessionPath);
-        assert.equal(stat.size, 0);
-        assert.equal(stat.mtimeMs, emptySessionStat!.mtimeMs);
-        assert.equal(stat.ino, emptySessionStat!.ino);
-        assert.equal(assignment.id, childSession);
-      }
-      const stopped =
-        mode === "identity-timeout" || mode === "identity-zero-byte-timeout";
-      assert.equal(started, !stopped);
+      assert.equal(started, true);
       assert.equal(
         pi.calls.some(
           (args) =>
@@ -6666,8 +6669,34 @@ async function runManagerStartupScenario(
       );
       assert.equal(
         pi.calls.some((args) => args[0] === "agent" && args[1] === "send-keys"),
-        stopped,
+        false,
       );
+      return;
+    }
+    if (mode.startsWith("pristine-")) {
+      const result = await execute();
+      assert.equal(result.details.ok, true, JSON.stringify(result.details));
+      assert.equal(result.details.session, childSession);
+      assert.equal(
+        pi.calls.some((args) => isPreservePaneStop(args)),
+        false,
+      );
+      assert.equal(started, true);
+      const assignment = listProjectAssignments(
+        supervisionRuntime(),
+        repoKey,
+      )[0]!;
+      assert.equal(assignment.id, childSession);
+      assert.equal(assignment.piSessionFile, undefined);
+      if (mode.includes("zero-byte")) {
+        assert.deepEqual(
+          realFs.readFileSync(childSessionPath),
+          Buffer.alloc(0),
+        );
+        const stat = realFs.statSync(childSessionPath);
+        assert.equal(stat.mtimeMs, emptySessionStat!.mtimeMs);
+        assert.equal(stat.ino, emptySessionStat!.ino);
+      } else assert.equal(realFs.existsSync(childSessionPath), false);
       return;
     }
     if (
@@ -7520,8 +7549,13 @@ for (const mode of [
   test(`Manager rechecks authority after assignment publication on ${mode}`, () =>
     runManagerStartupScenario(mode));
 for (const mode of [
-  "identity-timeout",
-  "identity-zero-byte-timeout",
+  "pristine-timeout",
+  "pristine-zero-byte-timeout",
+  "pristine-zero-byte-at-start",
+] as const)
+  test(`Manager keeps a verified pristine Lead whose session file is unwritten on ${mode}`, () =>
+    runManagerStartupScenario(mode));
+for (const mode of [
   "identity-unproven",
   "identity-mismatch",
   "identity-cleanup-mismatch",
